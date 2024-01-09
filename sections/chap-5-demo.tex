@@ -338,12 +338,322 @@ Sau khi đã scale số pod lên đến mức tối đa là 10, ta terminate bus
 % TODO: Các phần này cần tự tìm thêm các nguồn khác để tìm hiểu
 \subsubsection{k6}
 % TODO: Các phần này cần tự tìm thêm các nguồn khác để tìm hiểu
+
 \subsection{Các bước thực hiện}
+\noindent Để có thể scale một service theo request, ta cần hiện thực các dịch vụ sau vào cluster:
 \begin{itemize}
-  \item Cài prometheus
-  \item Cài Keda
-  \item Cài kube-state-metrics
-  \item Viết Keda ScaledObject.
+  \item Prometheus server
+  \item Keda runtime.
 \end{itemize}
+Các bước thực hiện cụ thể sẽ được mô tả ở các tiểu mục bên dưới.
+\subsubsection{Hiện thực prometheus server}
+\noindent Để hiện thực Prometheus server, ta cần làm theo các bước sau:\footnote{https://devopscube.com/setup-prometheus-monitoring-on-kubernetes/}
+% \begin{enumerate}[label=\textbf{Bước \arabic*:}, leftmargin=*]
+\begin{itemize}
+  \item \textbf{Bước 1: Tạo Namespace và ClusterRole.}\\[0.2cm]
+  Ta sẽ tạo một namespace riêng cho Prometheus server và các service đi theo nó, mục đích là để tách biệt chúng ra khỏi các service phục vụ cho các yêu cầu khác của hệ thống.\\[0.2cm]
+  Ta tạo namespace \textbf{monitoring} bằng câu lệnh \lstinline|kubectl create namespace monitoring|.\\[0.2cm]
+  Sau đó, ta áp dụng config Cluster Role dưới đây vào cluster:
+  \begin{lstlisting}[language=yaml]
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - nodes/proxy
+  - services
+  - endpoints
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - extensions
+  resources:
+  - ingresses
+  verbs: ["get", "list", "watch"]
+- nonResourceURLs: ["/metrics"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: monitoring
+
+  \end{lstlisting}
+  \item \textbf{Bước 2: Tạo Config map để mở rộng cấu hình của Prometheus}\\[0.2cm]
+  Prometheus, theo như ở phần trên, có thể đóng rất nhiều vai trò khác nhau trong một hệ thống. Do đó, việc cần điểu chỉnh cấu hình của nó là điều thường xuyên xảy ra. Thay vì cần phải build lại image của Prometheus mỗi khi cấu hình được điều chỉnh, thì nay ta có thể đem những cấu hình đó ra ngoài dưới dạng 1 file config map, từ đó tiết kiệm thời gian áp dụng thay đổi, thay vì phải build lại image, rồi push image lên hub, cuối cùng là kéo về cluster, thì ta chỉ cần khởi đọng lại prometheus pod là được.\\[0.2cm]
+  Cấu hình Config map của prometheus như sau:
+  \begin{lstlisting}[language=yaml]
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-server-conf
+  labels:
+    name: prometheus-server-conf
+  namespace: monitoring
+data:
+  prometheus.rules: |-
+    groups:
+    - name: devopscube demo alert
+      rules:
+      - alert: High Pod Memory
+        expr: sum(container_memory_usage_bytes) > 1
+        for: 1m
+        labels:
+          severity: slack
+        annotations:
+          summary: High Memory Usage
+  prometheus.yml: |-
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+    rule_files:
+      - /etc/prometheus/prometheus.rules
+    alerting:
+      alertmanagers:
+      - scheme: http
+        static_configs:
+        - targets:
+          - "alertmanager.monitoring.svc:9093"
+    scrape_configs:
+      - job_name: 'node-exporter'
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_endpoints_name]
+          regex: 'node-exporter'
+          action: keep
+      - job_name: 'kubernetes-apiservers'
+        kubernetes_sd_configs:
+        - role: endpoints
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+          action: keep
+          regex: default;kubernetes;https
+      - job_name: 'kubernetes-nodes'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+        - role: node
+        relabel_configs:
+        - action: labelmap
+          regex: __meta_kubernetes_node_label_(.+)
+        - target_label: __address__
+          replacement: kubernetes.default.svc:443
+        - source_labels: [__meta_kubernetes_node_name]
+          regex: (.+)
+          target_label: __metrics_path__
+          replacement: /api/v1/nodes/${1}/proxy/metrics
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+        - role: pod
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+          action: replace
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+          target_label: __address__
+        - action: labelmap
+          regex: __meta_kubernetes_pod_label_(.+)
+        - source_labels: [__meta_kubernetes_namespace]
+          action: replace
+          target_label: kubernetes_namespace
+        - source_labels: [__meta_kubernetes_pod_name]
+          action: replace
+          target_label: kubernetes_pod_name
+      - job_name: 'kube-state-metrics'
+        static_configs:
+          - targets: ['kube-state-metrics.kube-system.svc.cluster.local:8080']
+      - job_name: 'kubernetes-cadvisor'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+        - role: node
+        relabel_configs:
+        - action: labelmap
+          regex: __meta_kubernetes_node_label_(.+)
+        - target_label: __address__
+          replacement: kubernetes.default.svc:443
+        - source_labels: [__meta_kubernetes_node_name]
+          regex: (.+)
+          target_label: __metrics_path__
+          replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+      - job_name: 'kubernetes-service-endpoints'
+        kubernetes_sd_configs:
+        - role: endpoints
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+          action: replace
+          target_label: __scheme__
+          regex: (https?)
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+          action: replace
+          target_label: __address__
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+        - action: labelmap
+          regex: __meta_kubernetes_service_label_(.+)
+        - source_labels: [__meta_kubernetes_namespace]
+          action: replace
+          target_label: kubernetes_namespace
+        - source_labels: [__meta_kubernetes_service_name]
+          action: replace
+          target_label: kubernetes_name
+  \end{lstlisting}
+  \item \textbf{Bước 3: Tạo một Prometheus Deployment}\\[0.2cm]
+  Sau khi chuẩn bị sẵn sàng các dịch vụ hỗ trợ đi kèm, ta có thể khởi tạo một deployment cho Prometheus server theo config dưới đây.
+  \begin{lstlisting}[language=yaml]
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-deployment
+  namespace: monitoring
+  labels:
+    app: prometheus-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus-server
+  template:
+    metadata:
+      labels:
+        app: prometheus-server
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus/"
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: prometheus-config-volume
+              mountPath: /etc/prometheus/
+            - name: prometheus-storage-volume
+              mountPath: /prometheus/
+      volumes:
+        - name: prometheus-config-volume
+          configMap:
+            defaultMode: 420
+            name: prometheus-server-conf
+  
+        - name: prometheus-storage-volume
+          emptyDir: {}
+  \end{lstlisting}
+  Khởi tạo thành công, ta có thể nhìn thấy sự xuất hiện của Prometheus pod và deployment ở namespace \textbf{monitoring} như hình dưới.
+  \begin{figure}[H]
+    \begin{center}
+      \includegraphics[scale = 0.4]{images/hanh/prometheus-deployment.png}
+      \caption{Prometheus pod và deployment được thể hiện ở minikube cluster dashboard}
+    \end{center}
+    \label{}
+  \end{figure}
+  \item \textbf{Bước 4: Kết nối tới Prometheus Dashboard}\\[0.2cm]
+  Sau khi đã cài đặt đầy đủ Prometheus server và các dịch vụ đi kèm, ta có thể truy cập vào dashboard của Prometheus để xem các thông số. Ví dụ với minikube cluster, ta có thể dùng lệnh \lstinline|minikube service prometheus-service| để mở cổng truy cập, cho phép truy cập từ máy tính của chúng ta vào Prometheus server.
+  \begin{figure}[H]
+    \begin{center}
+      \includegraphics[scale=0.4]{images/hanh/prometheus-dashboard.png}
+      \caption{Prometheus dashboard khi vừa mới khởi tạo}
+    \end{center}
+    \label{}
+  \end{figure}
+
+\end{itemize}
+\subsubsection{Hiện thực Keda runtime}
+\noindent Các ScaledObject của Keda không phải tự nhiên mà có thể vân hành tốt với Kubernetes cluster, mà cần có sư hỗ trợ của keda runtime để có thể vận hành các chức năng cần thiết. May mắn thay, đội ngũ phát triển của Keda đã cung cấp và gói gọn cho chúng ta toàn bộ các cấu hình cần thiết vào trong 1 file cấu hình yaml dài hơn 9700 dòng, mà từ đó ta có thể dễ dàng cài đặt thông qua câu lệnh sau: \lstinline|kubectl apply --server-side -f https://|\lstinline|github.com/kedacore/keda/releases/download/v2.12.1/keda-2.12.1-core.yaml|\\[0.2cm]
+Sau khi quá trình cài đặt hoàn tất, ta có thể kiểm tra các dịch vụ đã được cài vào trong cluster thông qua minikube dashboard, namespace \textbf{keda}.
+\begin{figure}[H]
+  \begin{center}
+    \includegraphics[scale=0.4]{images/hanh/keda-deployment.png}
+    \caption{Các deployment và pod phục vụ cho Keda runtime được khởi tạo}
+  \end{center}
+  \label{}
+\end{figure}
+
+\subsubsection{Hiện thực Keda ScaledObject}
+\noindent Khi Prometheus server đã sẵn sàng để tiếp nhận thông tin, Keda runtime sẵn sàng cung cấp thông tin đó tới các Keda object thông qua API \lstinline|keda.sh|, thì đó là lúc ta có thể tiến hành cài đặt Keda ScaledObject, nhằm phục vụ cho việc scale theo request của dịch vụ theo cấu hình dưới đây.
+
+\begin{lstlisting}[language=yaml]
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: prometheus-scaledobject
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: catalog-ms-1-deploy
+  pollingInterval: 10  # Optional. Default: 30 seconds
+  cooldownPeriod:  15 # Optional. Default: 300 seconds
+  minReplicaCount: 1   # Optional. Default: 0
+  maxReplicaCount: 10 # Optional. Default: 100
+  # fallback:           # Optional. Section to specify fallback options
+  #   failureThreshold: 3    # Mandatory if fallback section is included
+  #   replicas: 1
+  advanced: # Optional. Section to specify advanced options
+    horizontalPodAutoscalerConfig: # Optional. Section to specify HPA related options
+      behavior: # Optional. Use to modify HPA's scaling behavior
+        scaleUp:
+          selectPolicy: Max
+          stabilizationWindowSeconds: 60
+          policies:
+            - periodSeconds: 30
+              type: Pods
+              value: 4
+        scaleDown:
+          selectPolicy: Min
+          stabilizationWindowSeconds: 60
+          policies:
+            - periodSeconds: 30
+              type: Pods
+              value: 4
+  triggers:
+  - type: prometheus
+    metadata:
+      # Required
+      serverAddress: http://prometheus-service.monitoring.svc.cluster.local:8080/
+      metricName: access_frequency
+      threshold: '1'
+      query: sum(rate(node_http_requests_total[1m]))
+\end{lstlisting}
+
 \subsection{Kiểm thử}
 \noindent Ta sử dụng k6 để chạy bài stress test để kiếm tra xem liệu có scale hay không.
+
+Đầu tiên ta thử khi chưa có scale object, kết quả là.
+Sau đó, ta thử bài test với việc có scale object, kết quả là
+
+Kết luận, k cải thiện dc nhiều do thiếu load balancer.
